@@ -1,3 +1,5 @@
+#define USR_FW_RELEASE "1.0.0"
+
 // The included MQTT library only allows a max packet size of 255.  According to the library, the packet
 // size is the total of [MQTT Header(Max:5byte) + Topic Name Length + Topic Name + Message ID(QoS1|2) + Payload]
 // The max packet size can be overwritten with the MQTT_MAX_PACKET_SIZE define.
@@ -13,14 +15,21 @@
 // WiFi or Cloud connection.  However we will wait for a WiFi connection in setup().
 SYSTEM_THREAD(ENABLED);
 
+// There seems to be a bug when running in threaded mode.  It is either in the Photon core code or MQTT
+// library.  If the WiFi connection is weak or if the Internet connection goes down, then the Photon will
+// sometimes hang in the application loop.  When the hang occurs it always seems to happen in the MQTT
+// library whenever _client->stop() is called.  A workaround for this is to setup the built-in Application
+// Watchdog and have it reset the Photon whenever the watchdog detects an application loop hang.
+// This work still needs to be done.
+
 // Defines for enabling Serial and Particle Cloud debug messages
 #define DEBUG_SERIAL
-#define DEBUG_CLOUD
+// #define DEBUG_CLOUD
 
-// Defines for extra level of debug
-#define DEBUG_WIND_SPEED
+// Defines for extra levels of debug messages
+// #define DEBUG_WIND_SPEED
 // #define DEBUG_WIND_DIR
-#define DEBUG_RAIN
+// #define DEBUG_RAIN
 
 // Defines for pins
 #define BUILTIN_LED     D7  // Built in LED pin
@@ -37,7 +46,8 @@ SYSTEM_THREAD(ENABLED);
 #endif
 
 // Interval at which to read the sensors in milliseconds
-#define READ_INTERVAL 10000
+#define READ_INTERVAL          10000  // 10 seconds
+#define MQTT_RETRY_INTERVAL    30000  // 30 seconds
 
 // Degree offset of wind direction sensor due to mounting orientation
 #define WIND_DIR_OFFSET 90.0
@@ -167,7 +177,6 @@ void setup() {
     // color until we connect to WiFi and mDNS finds the MQTT broker.
     // Delay to make sure we can see the LED color before exiting setup.
     set_led_color(SETUP);
-    delay(1000);
 
     // Initialize the BUILTIN_LED pin as an output
     pinMode(BUILTIN_LED, OUTPUT);
@@ -195,12 +204,17 @@ void setup() {
     
     debug_message("Date/Time: " + Time.timeStr() + " DST is " + (Time.isDST() ? "ON" : "OFF"));
     
+    // Read the FW revision
     debug_message("Firmware Rev: " + System.version(), true);
 
+    // Read the Device ID
     deviceId = System.deviceID();
     debug_message("Device ID: " + deviceId);
 
-    // Modify the topics now that we know the device ID.
+    // User FW release version
+    debug_message("User Firmware Rev: " + String(USR_FW_RELEASE), true);
+
+    // Modify the MQTT topics now that we know the device ID.
     mqttSensorOutputTopic.replace("+", deviceId);
     mqttControlInputTopic.replace("+", deviceId);
     mqttDebugOutputTopic.replace("+", deviceId);
@@ -246,6 +260,8 @@ void setup() {
 
     // Necessary call to enable temp, baro, and alt readings 
     sensor.enableEventFlags();
+
+    delay(1000);
 
     // Check the WiFi connection
     check_wifi();
@@ -358,45 +374,19 @@ void check_wifi() {
 }
 
 // Use mDNS to locate an MQTT broker and create the client instance.
-// The actual connect will happen in the loop()
 void setup_mqtt_broker() {
     
-/*
-    if (!MDNS.begin(hostName)) {4}
+    // The mDNS library available for the Photon works only for mDNS servers and does not support clients,
+    // unlike the mDNS library for the ESP8266 which supports both servers and clients.  Therefore
+    // we cannot do mDNS MQTT service discovery on the Photon currently.  With more ambition, I
+    // might do a port of the mDNS client to the Photon.
 
-    // Scan until an MQTT broker is found
-    Serial.println("Using mDNS to find an MQTT broker");
-    while (true) {
-        MDNS.update();
-        int n = MDNS.queryService("mqtt", "tcp");
-        if (n == 0) {
-            Serial.println("No MQTT services found...retry in 60 seconds");
-            // Wait 60 seconds before retrying
-            delay(60000);
-        }
-        else {
-            Serial.println("Found an MQTT broker");
-            Serial.print("Hostname:   ");
-            Serial.println(MDNS.hostname(0));
-            Serial.print("IP address: ");
-            Serial.println(MDNS.IP(0));
-            Serial.print("Port num:   ");
-            Serial.println(MDNS.port(0));
-            Serial.println("");
-*/    
-            // Set the MQTT server and port to attach to
-            
-            // mDNS not implemented yet so hard code the address and port
+    // mDNS not implemented yet so hard code the address and port
 
-            // brokerIP is a pointer to an array of bytes and must be persistent once this
-            // routine exits, meaning use new or make it a global array.
-            mqttClient = new MQTT(brokerIP, 1883, mqtt_callback);
-            
-/*
-            break;
-        }
-    }
-*/
+    // brokerIP is a pointer to an array of bytes and must be persistent once this
+    // routine exits, meaning use new or make it a global array.
+    mqttClient = new MQTT(brokerIP, 1883, mqtt_callback);
+
 }
 
 // Check the network connections
@@ -479,7 +469,7 @@ void check_network(State* currentState) {
             
         }
         
-        // No errors or signal strength values beyond the limit
+        // No errors and signal strength values above the threshold
         else {
             
             // Not connected to MQTT broker, set the LED and try to reconnect.
@@ -510,7 +500,7 @@ void check_network(State* currentState) {
             debug_message("No Particle Cloud connection");
             lastDebugMessage = currentTime;
         }
-            
+        
         // Update the current state
         *currentState = NO_CLOUD;
         
@@ -533,15 +523,15 @@ void check_network(State* currentState) {
 // Connect to the MQTT broker
 void mqtt_reconnect(int sigStrength) {
 
-    static unsigned long lastAttempt = 0;
+    static unsigned long lastAttempt = millis() - MQTT_RETRY_INTERVAL;
     unsigned long currentTime = millis();
     
     // If not connected and the retry timeout has expired then retry again.  Do not block
     // here as we want the rainfall history to go ahead and update even though we cannot
     // send data while the broker connection is down.
-    if (WiFi.ready() && (! mqttClient->isConnected()) && (currentTime - lastAttempt > 30000)) {
+    if (WiFi.ready() && (! mqttClient->isConnected()) && (currentTime - lastAttempt > MQTT_RETRY_INTERVAL)) {
         
-        debug_message(String::format("Attempting MQTT broker connection, WiFi signal strength: %d dBm...", sigStrength), true);
+        debug_message(String::format("Attempting MQTT broker connection, WiFi signal strength: %d dBm...", sigStrength));
         
         // Attempt to connect
         if (mqttClient->connect(mqttClientId)) {
@@ -708,7 +698,8 @@ void rain_isr() {
 void get_weather(State currentState) {
     
     // Variables for determining when sensors should be read again
-    static unsigned long previousReadTime = 0;
+    // Delay 5 seconds for first read to give time to connect to MQTT broker
+    static unsigned long previousReadTime = millis() + min(5000, READ_INTERVAL) - READ_INTERVAL;
     unsigned long currentTime = millis();
 
     // Check to see if it is time to read the sensors
@@ -754,16 +745,16 @@ void get_weather(State currentState) {
         JsonObject& root = jsonBuffer.createObject();
         
         // Put the data into the JSON object.
-        root.add("temperature").set(temp, 3);
+        root.add("temp").set(temp, 3);
         root.add("humidity").set(humidity, 3);
         
         JsonObject& barometer = root.createNestedObject("barometer");
-        barometer.add("temperature").set(baroTemp, 3);
+        barometer.add("temp").set(baroTemp, 3);
         barometer.add("pressure").set(pascals, 2);
         // barometer.add("altitude").set(altitude, 2);
         
         JsonObject& wind = root.createNestedObject("wind");
-        wind.add("direction").set(windDir, 1);
+        wind.add("dir").set(windDir, 1);
         wind.add("speed").set(windSpeed, 3);
         
 #ifdef DEBUG_WIND_SPEED
@@ -773,7 +764,7 @@ void get_weather(State currentState) {
         debug["ticks"] = windTicks;
 #endif
         
-        root.add("wifi_sig").set(WiFi.RSSI(),0);
+        root.add("rssi").set(WiFi.RSSI(),0);
         
         // Turn the JSON structure into a string for sending over the MQTT topic.
         char jsonOutputBuffer[255];
@@ -980,7 +971,7 @@ void set_led_color(State color) {
             RGB.color(255, 0, 0);       // Red
             break;
         case WEAK_SIG:
-            RGB.color(255, 96, 0);     // Orange
+            RGB.color(255, 96, 0);      // Orange
             break;
         case NO_MQTT:
             RGB.color(255, 255, 0);     // Yellow
